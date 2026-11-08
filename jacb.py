@@ -145,8 +145,7 @@ def activate(app):
         if nb.get_n_pages() == 0:
             win.close()
 
-    def new_tab(uri=HOME):
-        web = WebKit.WebView(user_content_manager=ucm)
+    def attach_tab(web, switch=True):
         label = Gtk.Label(label="New Tab", ellipsize=Pango.EllipsizeMode.END,
                           width_chars=14, max_width_chars=18, xalign=0)
         close = Gtk.Button(icon_name="window-close-symbolic", has_frame=False)
@@ -158,8 +157,35 @@ def activate(app):
                     lambda w, _: label.set_text(w.get_title() or "New Tab"))
         web.connect("notify::uri",
                     lambda w, _: url.set_text(w.get_uri() or "") if w is cur() else None)
-        nb.set_current_page(nb.append_page(web, tab))
+        web.connect("notify::is-loading",
+                    lambda w, _: sync_nav() if w is cur() else None)
+        web.connect("load-changed",
+                    lambda w, _: sync_nav() if w is cur() else None)
+        web.connect("create", on_create)
+        web.connect("close", close_tab)          # window.close()
+        page = nb.append_page(web, tab)
+        if switch:
+            nb.set_current_page(page)
+        return web
+
+    def new_tab(uri=HOME):
+        web = attach_tab(WebKit.WebView(user_content_manager=ucm))
         web.load_uri(uri)
+        return web
+
+    def on_create(web, _nav_action):
+        """target="_blank", middle-click and window.open() all land here.
+
+        related_view keeps the popup in the opener's web process (WebKit
+        requires it for views returned from ::create), but it does NOT carry
+        over the user content manager -- pass ucm or SUAIJP wouldn't apply.
+        """
+        new = WebKit.WebView(related_view=web, user_content_manager=ucm)
+        attach_tab(new, switch=False)
+        # WebKit loads the URI itself; only surface the tab once it's ready.
+        new.connect("ready-to-show",
+                    lambda w: nb.set_current_page(nb.page_num(w)))
+        return new
 
     def go(entry):
         t = entry.get_text().strip()
@@ -171,33 +197,66 @@ def activate(app):
             t = "https://duckduckgo.com/?q=" + quote(t)
         if cur():
             cur().load_uri(t)
+            cur().grab_focus()
 
     url.connect("activate", go)
-    nb.connect("switch-page", lambda _n, page, _i: url.set_text(page.get_uri() or ""))
+    def switched(_nb, page, _i):
+        url.set_text(page.get_uri() or "")
+        sync_nav(page)       # get_current_page() is still stale in this handler
 
-    back = Gtk.Button(icon_name="go-previous-symbolic")
-    fwd = Gtk.Button(icon_name="go-next-symbolic")
-    plus = Gtk.Button(icon_name="tab-new-symbolic")
+    nb.connect("switch-page", switched)
+
+    def reload_or_stop(*_):
+        web = cur()
+        if web is None:
+            return
+        web.stop_loading() if web.is_loading() else web.reload()
+
+    def focus_url(*_):
+        url.grab_focus()
+        url.select_region(0, -1)
+
+    def sync_nav(web=None):
+        """Keep reload/stop and back/forward in step with the visible tab."""
+        web = web or cur()
+        loading = bool(web and web.is_loading())
+        reload_btn.set_icon_name("process-stop-symbolic" if loading
+                                 else "view-refresh-symbolic")
+        reload_btn.set_tooltip_text("Stop" if loading else "Reload")
+        back.set_sensitive(bool(web and web.can_go_back()))
+        fwd.set_sensitive(bool(web and web.can_go_forward()))
+
+    back = Gtk.Button(icon_name="go-previous-symbolic", tooltip_text="Back")
+    fwd = Gtk.Button(icon_name="go-next-symbolic", tooltip_text="Forward")
+    reload_btn = Gtk.Button(icon_name="view-refresh-symbolic",
+                            tooltip_text="Reload")
+    plus = Gtk.Button(icon_name="tab-new-symbolic", tooltip_text="New Tab")
     back.connect("clicked", lambda _: cur() and cur().go_back())
     fwd.connect("clicked", lambda _: cur() and cur().go_forward())
+    reload_btn.connect("clicked", reload_or_stop)
     plus.connect("clicked", lambda _: new_tab())
 
-    for name, accel, fn in (("new-tab", "<Ctrl>t", lambda *_: new_tab()),
-                            ("close-tab", "<Ctrl>w", lambda *_: cur() and close_tab(cur()))):
+    for name, accels, fn in (
+            ("new-tab", ["<Ctrl>t"], lambda *_: new_tab()),
+            ("close-tab", ["<Ctrl>w"], lambda *_: cur() and close_tab(cur())),
+            ("focus-url", ["<Ctrl>l", "F6"], focus_url),
+            ("reload", ["<Ctrl>r", "F5"], reload_or_stop)):
         act = Gio.SimpleAction.new(name, None)
         act.connect("activate", fn)
         win.add_action(act)
-        app.set_accels_for_action("win." + name, [accel])
+        app.set_accels_for_action("win." + name, accels)
 
     bar = Gtk.HeaderBar()
     bar.pack_start(back)
     bar.pack_start(fwd)
+    bar.pack_start(reload_btn)
     bar.pack_start(plus)
     bar.set_title_widget(url)
     win.set_titlebar(bar)
     win.set_child(nb)
 
     new_tab()
+    sync_nav()
     win.present()
     load_suaijp(ucm)
 
